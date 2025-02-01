@@ -1,114 +1,113 @@
 import json
 import torch
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from sklearn.metrics import classification_report, confusion_matrix
 from transformers import (
     AutoTokenizer, AutoModelForSequenceClassification, 
-    AutoModelForSeq2SeqLM, AutoModelForQuestionAnswering, pipeline
+    AutoModelForSeq2SeqLM, pipeline
 )
 
 # ** Cihaz Ayarı (MPS/CPU)**
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
-# ** Kullanılacak Modeller**
-MODELS = {
-    "BERT": "textattack/bert-base-uncased-SST-2",  # Metin sınıflandırma
-    "BART": "facebook/bart-large-cnn",  # Özetleme
-    "DeBERTa": "microsoft/deberta-large-mnli",  # Zero-shot sınıflandırma
-    "T5": "t5-small",  # Metinden etik öneriler üretme
-    "ALBERT": "albert-base-v2",  # Metin sınıflandırma
-    "BERT_QA": "deepset/bert-base-cased-squad2"  # BERT Soru-Cevaplama
-}
+# ** Model ve Tokenizer Yükleme**
+MODEL_NAME_BERT = "textattack/bert-base-uncased-SST-2"
+MODEL_NAME_BART = "facebook/bart-large-cnn"
 
-# ** Veri Setini Yükleme Fonksiyonu**
+bert_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME_BERT)
+bert_model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME_BERT).to(device)
+
+bart_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME_BART)
+bart_model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME_BART).to(device)
+
+# ** Veri Setini Yükleme**
 def load_dataset(json_path):
     print(" Veri seti yükleniyor...")
-    try:
-        with open(json_path, "r", encoding="utf-8") as file:
-            data = json.load(file)
+    with open(json_path, "r", encoding="utf-8") as file:
+        data = json.load(file)
 
-        if isinstance(data, dict):
-            texts = data.get("text", [])  
-        elif isinstance(data, list):
-            texts = [entry.get("text", "") for entry in data]
-        else:
-            print(" Veri formatı hatalı!")
-            return None
+    texts = [entry.get("text", "") for entry in data] if isinstance(data, list) else data.get("text", [])
+    print(f" Veri başarıyla yüklendi! Toplam {len(texts)} kayıt var.")
+    return texts
 
-        print(f" Veri başarıyla yüklendi! Toplam {len(texts)} kayıt var.")
-        return texts
-    except Exception as e:
-        print(f" Veri yükleme hatası: {e}")
-        return None
-
-# ** Model Yükleme Fonksiyonları**
-def load_model(model_name):
-    print(f" {model_name} modeli yükleniyor...")
-    tokenizer = AutoTokenizer.from_pretrained(MODELS[model_name])
-    model = AutoModelForSequenceClassification.from_pretrained(MODELS[model_name]).to(device)
-    return tokenizer, model
-
-def load_summarization_model():
-    tokenizer = AutoTokenizer.from_pretrained(MODELS["BART"])
-    model = AutoModelForSeq2SeqLM.from_pretrained(MODELS["BART"]).to(device)
-    return tokenizer, model
-
-# ** Metin Sınıflandırma (BERT ve ALBERT)**
-def classify_text(tokenizer, model, text):
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True).to(device)
+# ** Metin Sınıflandırma**
+def classify_text(text):
+    inputs = bert_tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=512).to(device)
     with torch.no_grad():
-        outputs = model(**inputs)
+        outputs = bert_model(**inputs)
     prediction = torch.argmax(outputs.logits, dim=-1).item()
-    return "Etik" if prediction == 1 else "Etik Değil"
+    return prediction  # 1: Etik, 0: Etik Değil
 
 # ** Metin Özetleme (BART)**
-def summarize_text(tokenizer, model, text):
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True).to(device)
+def summarize_text(text):
+    inputs = bart_tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=512).to(device)
     with torch.no_grad():
-        summary_ids = model.generate(inputs["input_ids"], max_length=100)
-    return tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+        summary_ids = bart_model.generate(inputs["input_ids"], max_length=100, num_return_sequences=1)
+    return bart_tokenizer.decode(summary_ids[0], skip_special_tokens=True)
 
-# ** Zero-Shot Etik Kategorilere Ayırma (DeBERTa)**
-def zero_shot_classification(text):
-    classifier = pipeline("zero-shot-classification", model=MODELS["DeBERTa"])
-    labels = ["etik", "etik değil", "tarafsız", "yanıltıcı"]
-    return classifier(text, candidate_labels=labels)["labels"][0]
+# ** Confusion Matrix ve Yanlış Tahmin Analizi**
+def analyze_results(y_true, y_pred, texts):
+    cm = confusion_matrix(y_true, y_pred)
+    report = classification_report(y_true, y_pred, target_names=["Etik Değil", "Etik"], output_dict=True)
 
-# ** T5 ile Etik Öneriler Üretme**
-def generate_suggestions(text):
-    tokenizer = AutoTokenizer.from_pretrained(MODELS["T5"])
-    model = AutoModelForSeq2SeqLM.from_pretrained(MODELS["T5"]).to(device)
-    inputs = tokenizer(f"Etik öneri üret: {text}", return_tensors="pt", truncation=True, padding=True).to(device)
-    with torch.no_grad():
-        summary_ids = model.generate(inputs["input_ids"], max_length=50)
-    return tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+    print("\n **Model Performansı:**")
+    print(classification_report(y_true, y_pred, target_names=["Etik Değil", "Etik"]))
 
-# ** BERT ile Soru-Cevap**
-def answer_question(question, context):
-    tokenizer = AutoTokenizer.from_pretrained(MODELS["BERT_QA"])
-    model = AutoModelForQuestionAnswering.from_pretrained(MODELS["BERT_QA"]).to(device)
-    
-    inputs = tokenizer(question, context, return_tensors="pt", truncation=True, padding=True).to(device)
-    with torch.no_grad():
-        outputs = model(**inputs)
-    
-    start_index = torch.argmax(outputs.start_logits)
-    end_index = torch.argmax(outputs.end_logits)
-    
-    answer = tokenizer.convert_tokens_to_string(
-        tokenizer.convert_ids_to_tokens(inputs["input_ids"][0][start_index:end_index+1])
-    )
-    
-    return answer if answer.strip() else "Cevap bulunamadı"
+    false_positives = [texts[i] for i in range(len(y_true)) if y_true[i] == 0 and y_pred[i] == 1]
+    false_negatives = [texts[i] for i in range(len(y_true)) if y_true[i] == 1 and y_pred[i] == 0]
 
-# **Grafik Üretme Fonksiyonları**
+    # **Confusion Matrix Görselleştirme**
+    plt.figure(figsize=(5, 5))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=["Etik Değil", "Etik"], yticklabels=["Etik Değil", "Etik"])
+    plt.xlabel("Tahmin Edilen")
+    plt.ylabel("Gerçek")
+    plt.title("Confusion Matrix")
+    plt.savefig("/Users/bilge/Downloads/confusion_matrix.png")
+    plt.show()
+
+    return false_positives, false_negatives, report
+
+# ** Feature Importance (Öznitelik Önemi) Analizi**
+def feature_importance_analysis(texts):
+    classifier = pipeline("text-classification", model=bert_model, tokenizer=bert_tokenizer)
+
+    importance_scores = []
+    for text in texts[:20]:  
+        tokenized_text = bert_tokenizer(text, truncation=True, max_length=512, return_tensors="pt")
+        result = classifier(bert_tokenizer.decode(tokenized_text["input_ids"][0], skip_special_tokens=True))[0]
+        importance_scores.append(result["score"])
+
+    plt.figure(figsize=(8, 5))
+    sns.barplot(x=list(range(1, 21)), y=importance_scores, palette="coolwarm")
+    plt.xlabel("Örnek No")
+    plt.ylabel("Önem Skoru")
+    plt.title("Feature Importance (Öznitelik Önem Skorları)")
+    plt.savefig("/Users/bilge/Downloads/feature_importance.png")
+    plt.show()
+
+# ** Precision, Recall ve F1-score Bar Grafiği**
+def plot_metrics(report):
+    metrics_df = pd.DataFrame(report).transpose()
+    metrics_df = metrics_df.iloc[:2]  
+
+    plt.figure(figsize=(6, 4))
+    sns.barplot(data=metrics_df[['precision', 'recall', 'f1-score']], palette="coolwarm")
+    plt.title("Precision, Recall ve F1-score")
+    plt.ylabel("Değer")
+    plt.savefig("/Users/bilge/Downloads/bert_model_metrics.png")
+    plt.show()
+
+# ** BERT Modeli Sonuç Dağılımı**
 def plot_bert_results(df):
     plt.figure(figsize=(6,4))
     sns.countplot(x="BERT_Result", data=df, palette="pastel")
     plt.title("BERT Modeli ile Etiket Dağılımı")
     plt.savefig("/Users/bilge/Downloads/bert_result_distribution.png")
 
+# ** BART Özetleme Uzunluk Dağılımı**
 def plot_summary_length(df):
     df["summary_length"] = df["BART_Summary"].apply(lambda x: len(str(x).split()))
     plt.figure(figsize=(6,4))
@@ -116,34 +115,36 @@ def plot_summary_length(df):
     plt.title("BART Özet Uzunluk Dağılımı")
     plt.savefig("/Users/bilge/Downloads/bart_summary_length.png")
 
-def generate_graphs(df):
-    plot_bert_results(df)
-    plot_summary_length(df)
-
-# **Ana Fonksiyon**
+# ** Ana Fonksiyon**
 def main():
     DATASET_PATH = "/Users/bilge/Downloads/oasst1_data.json"
-
     texts = load_dataset(DATASET_PATH)
-    if texts is None:
-        return
 
-    bert_tokenizer, bert_model = load_model("BERT")
-    bart_tokenizer, bart_model = load_summarization_model()
+    y_true = [1 if "etik" in text.lower() else 0 for text in texts[:50]]
+    y_pred = [classify_text(text) for text in texts[:50]]
+    bart_summaries = [summarize_text(text) for text in texts[:50]]
 
-    results = []
-    for i, text in enumerate(texts[:50]):
-        print(f"{i+1}. veri işleniyor...")
-        bert_result = classify_text(bert_tokenizer, bert_model, text)
-        bart_result = summarize_text(bart_tokenizer, bart_model, text)
-        results.append({"text": text, "BERT_Result": bert_result, "BART_Summary": bart_result})
+    false_positives, false_negatives, report = analyze_results(y_true, y_pred, texts[:50])
 
-    df = pd.DataFrame(results)
-    results_path = "/Users/bilge/Downloads/ethics_analysis_results.csv"
-    df.to_csv(results_path, index=False)
+    df_results = pd.DataFrame({
+        "Text": texts[:50], 
+        "BERT_Result": y_pred, 
+        "BART_Summary": bart_summaries
+    })
 
-    generate_graphs(df)
-    print("Sonuçlar ve grafikler kaydedildi.")
+    df_fp = pd.DataFrame({"False Positive Örnekler": false_positives})
+    df_fn = pd.DataFrame({"False Negative Örnekler": false_negatives})
+
+    df_fp.to_csv("/Users/bilge/Downloads/false_positive_samples.csv", index=False)
+    df_fn.to_csv("/Users/bilge/Downloads/false_negative_samples.csv", index=False)
+
+    print(" Yanlış pozitif ve negatif örnekler kaydedildi.")
+
+    feature_importance_analysis(texts[:50])
+
+    plot_bert_results(df_results)
+    plot_summary_length(df_results)
+    plot_metrics(report)
 
 if __name__ == "__main__":
     main()
